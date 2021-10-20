@@ -4,7 +4,6 @@
 using namespace std;
 
 int main(int argc, char *argv[]){
-
 	int opt;
 	int p = 1;
 	double t = 0.0;
