@@ -7,6 +7,8 @@
 
 using namespace std;
 
+#define MAX_PIPE_SIZE 65536
+
 int main(int argc, char *argv[]){
 	int opt;
 	int p = 1;
@@ -17,9 +19,12 @@ int main(int argc, char *argv[]){
 	string bcapstring = "";
 	bool isNewChan = false;
 	bool reqFile = false;
+	struct timeval start, end;
+	double timeTaken;
+
 	// take all the arguments first because some of these may go to the server
 	// p->patient #, t->time (0-60), e->ecg val (1 or 2), f->
-	while ((opt = getopt(argc, argv, "p:t:e:f:m:")) != -1) {
+	while ((opt = getopt(argc, argv, "p:t:e:f:m:c")) != -1) {
 		switch (opt) {
 			case 'f':
 				filename = optarg;
@@ -62,12 +67,13 @@ int main(int argc, char *argv[]){
 	}
 
 	FIFORequestChannel chan ("control", FIFORequestChannel::CLIENT_SIDE);
-	if (t == -1 && e == -1) {
+	if (t == -1 && e == -1 && filename == "") {
+		gettimeofday(&start, NULL);
 		string contents;
 		ostringstream ostr;
 		for (int i = 0; i < 1000; i++) {
 			double time = i*0.004;
-			DataRequest d(p, i*0.004, 1);
+			DataRequest d(p, time, 1);
 			chan.cwrite (&d, sizeof (DataRequest)); // question
 			double reply;
 			chan.cread (&reply, sizeof(double)); //answer
@@ -76,7 +82,7 @@ int main(int argc, char *argv[]){
 				exit (0);
 			}
 
-			DataRequest d2(p, i*0.004, 2);
+			DataRequest d2(p, time, 2);
 			chan.cwrite (&d2, sizeof (DataRequest));
 			double reply2;
 			chan.cread(&reply2, sizeof(double));
@@ -86,7 +92,7 @@ int main(int argc, char *argv[]){
 			}
 
 			// print out output for testing
-			std::cout << "time: " << time << " -> " << reply << " " << reply2 << endl;
+			// std::cout << "time: " << time << " -> " << reply << " " << reply2 << endl;
 			
 			// write to file
 			ostr << time << "," << reply << "," << reply2 << endl;
@@ -96,6 +102,27 @@ int main(int argc, char *argv[]){
 		string fname = to_string(p) + "_first_1000.csv";
 		file.open(fname, fstream::out);
 		file << contents;
+
+		gettimeofday(&end, NULL);
+		timeTaken = (((end.tv_sec * 1000000 + end.tv_usec) - (start.tv_sec * 1000000 + start.tv_usec)) /1000000.0);
+		std::cout << "time elapsed while transferring first 1000: " << timeTaken << endl;
+	} else if ((t != -1) && (e != -1) && (filename == "")) {
+		gettimeofday(&start, NULL);
+		DataRequest dCheck(10, 4, 1);
+		chan.cwrite (&dCheck, sizeof (DataRequest)); // question
+		double replyCheck;
+		chan.cread (&replyCheck, sizeof(double)); //answer
+		if (!isValidResponse(&replyCheck)){
+			std::cout << "Invalid Response 1" << endl;
+			exit (0);
+		}
+		std::cout << "For patient " << p << 
+		", at time " << t << "ms, ECG num " <<
+		e << "is " << replyCheck << endl;
+
+		gettimeofday(&end, NULL);
+		timeTaken = (((end.tv_sec * 1000000 + end.tv_usec) - (start.tv_sec * 1000000 + start.tv_usec)) /1000000.0);
+		std::cout << "time elapsed while transferring 1 data point: " << timeTaken << endl;
 	}
 
 	/* this section shows how to get the length of a file
@@ -103,6 +130,7 @@ int main(int argc, char *argv[]){
 	(i.e., due to buffer space limitation) and assemble it
 	such that it is identical to the original*/
 	if (reqFile) {
+		gettimeofday(&start, NULL);
 		FileRequest fm (0,0);
 		int len = sizeof (FileRequest) + filename.size()+1;
 		char buf2 [len];
@@ -117,16 +145,42 @@ int main(int argc, char *argv[]){
 	
 		// original if statemnt content
 		int64 rem = filelen;
-		FileRequest* f = (FileRequest*) buf2;
-		ofstream of (filename);
-		char recvBuf [buffercapacity];
+		FileRequest* f = (FileRequest*) buf2;	
+		string filenameComplete = "received/" + filename;
+		ofstream of (filenameComplete);
+		std::cout << f->length << " " << f->offset << endl;
 		while (rem > 0) {
 			f->length = min(rem, (int64)buffercapacity);
-			chan.cwrite (buf2, sizeof (buf2));
-			chan.cread(recvBuf, buffercapacity);
+			chan.cwrite (buf2, len);
+
+			// write a loop that keeps cread()ing until the return value
+			// of it (indicating the number of bytes read) equals 0
+			//int bytesLeft = chan.cread(recvBuf, buffercapacity)
+			/*
+			char recvBuf[f->length];
+			chan.cread(recvBuf, f->length);
 			of.write(recvBuf, f->length);
+			f->offset += f->length;
+			*/
+			
+			int bytesLeft = f->length;
+			// char recvBuf [f->length];
+			while (bytesLeft != 0) {
+				char recvBuf[min(f->length, MAX_PIPE_SIZE)];
+				int bytesRead = chan.cread(recvBuf, bytesLeft);
+				of.write(recvBuf, min(bytesLeft, MAX_PIPE_SIZE));
+				std::cout << "bytesRead: " << bytesRead << endl;
+				f->offset += bytesRead;
+				bytesLeft -= bytesRead;
+				std::cout << "bytesLeft: " << bytesLeft << endl;
+			}
+			std::cout << "offset: " << f->offset << endl;
+			std::cout << "--------------------------------------" << endl;
 			rem -= 	f->length;
 		}
+		gettimeofday(&end, NULL);
+		timeTaken = (((end.tv_sec * 1000000 + end.tv_usec) - (start.tv_sec * 1000000 + start.tv_usec)) /1000000.0);
+		std::cout << "time elapsed while writing file: " << timeTaken << endl;
 	}
 
 	if (isNewChan) {
@@ -136,9 +190,22 @@ int main(int argc, char *argv[]){
 		chan.cread(chanName, sizeof(chanName));
 
 		FIFORequestChannel newchan (chanName, FIFORequestChannel::CLIENT_SIDE);
+		std::cout << "New channel created..." << chanName << endl;
+		
+		// test new channel
+		DataRequest dCheck(10, 4, 1);
+		chan.cwrite (&dCheck, sizeof (DataRequest)); // question
+		double replyCheck;
+		chan.cread (&replyCheck, sizeof(double)); //answer
+		if (!isValidResponse(&replyCheck)){
+			std::cout << "Invalid Response" << endl;
+			exit (0);
+		}
+		std::cout << "For patient 10, at time 4ms, ECG num 1 is " << replyCheck << endl;
 
 		Request q (QUIT_REQ_TYPE);
 		newchan.cwrite (&q, sizeof(Request));
+		std::cout << "New channel closed..." << endl;
 	}
 
 	// closing the channel    
